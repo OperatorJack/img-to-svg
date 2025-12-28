@@ -1,0 +1,42 @@
+{
+  "name": "img-to-svg",
+  "version": "1.0.0",
+  "description": "Convert raster images (PNG, JPEG, etc.) to SVG vectors with automatic background removal and color preservation",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "img-to-svg": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "svg",
+    "vectorize",
+    "image-to-svg",
+    "png-to-svg",
+    "jpeg-to-svg",
+    "potrace",
+    "convert",
+    "raster-to-vector"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^5.3.0",
+    "commander": "^12.1.0",
+    "potrace": "^2.1.8",
+    "sharp": "^0.33.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/potrace": "^2.1.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
