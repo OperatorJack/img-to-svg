@@ -44,6 +44,8 @@ export interface ImageToSvgOptions {
   alphaMax?: number;
   /** Upscale factor before tracing for smoother curves. Default: 2 */
   upscale?: number;
+  /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
+  gradientCleanup?: number;
 }
 
 interface RGB {
@@ -334,6 +336,212 @@ export async function trimAlpha(imageBuffer: Buffer): Promise<Buffer> {
       width: extractWidth,
       height: extractHeight,
     })
+    .png()
+    .toBuffer();
+}
+
+/**
+ * Check if a color lies on a gradient between two other colors
+ * Returns true if the test color appears to be a blend of color1 and color2
+ */
+function isColorOnGradient(test: RGB, color1: RGB, color2: RGB, tolerance: number): boolean {
+  // Check if test color's components fall between color1 and color2
+  const rMin = Math.min(color1.r, color2.r) - tolerance;
+  const rMax = Math.max(color1.r, color2.r) + tolerance;
+  const gMin = Math.min(color1.g, color2.g) - tolerance;
+  const gMax = Math.max(color1.g, color2.g) + tolerance;
+  const bMin = Math.min(color1.b, color2.b) - tolerance;
+  const bMax = Math.max(color1.b, color2.b) + tolerance;
+
+  return (
+    test.r >= rMin && test.r <= rMax &&
+    test.g >= gMin && test.g <= gMax &&
+    test.b >= bMin && test.b <= bMax
+  );
+}
+
+/**
+ * Get the dominant (most frequent) non-transparent color in an image
+ * Quantizes colors to reduce noise from anti-aliasing
+ */
+async function getDominantColor(imageBuffer: Buffer): Promise<RGB | null> {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const channels = info.channels;
+  const colorCounts = new Map<string, { color: RGB; count: number }>();
+
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = channels >= 4 ? data[i + 3] : 255;
+    if (alpha < 128) continue; // Skip transparent pixels
+
+    // Quantize colors by dividing by 8 to reduce noise
+    const r = Math.floor(data[i] / 8) * 8;
+    const g = Math.floor(data[i + 1] / 8) * 8;
+    const b = Math.floor(data[i + 2] / 8) * 8;
+    const key = `${r},${g},${b}`;
+
+    const existing = colorCounts.get(key);
+    if (existing) {
+      existing.count++;
+    } else {
+      colorCounts.set(key, { color: { r, g, b }, count: 1 });
+    }
+  }
+
+  if (colorCounts.size === 0) return null;
+
+  // Find the most frequent color
+  let maxCount = 0;
+  let dominantColor: RGB | null = null;
+
+  for (const { color, count } of colorCounts.values()) {
+    if (count > maxCount) {
+      maxCount = count;
+      dominantColor = color;
+    }
+  }
+
+  return dominantColor;
+}
+
+/**
+ * Clean up gradient bleeding at edges after background removal.
+ * Removes intermediate transition colors between content and background.
+ */
+export async function cleanupGradientEdges(
+  imageBuffer: Buffer,
+  options: {
+    backgroundColor?: RGB;
+    passes?: number;
+    gradientTolerance?: number;
+  } = {}
+): Promise<Buffer> {
+  const {
+    passes = 2,
+    gradientTolerance = 40,
+  } = options;
+
+  // Get dominant content color
+  const dominantColor = await getDominantColor(imageBuffer);
+  if (!dominantColor) {
+    return imageBuffer; // No content color found
+  }
+
+  let { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height } = info;
+  const channels = 4; // RGBA
+
+  // Work with mutable copy
+  let currentData = Buffer.from(data);
+
+  for (let pass = 0; pass < passes; pass++) {
+    let pixelsRemoved = 0;
+    const outputData = Buffer.from(currentData);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * channels;
+        const alpha = currentData[idx + 3];
+
+        if (alpha < 128) continue; // Skip already transparent
+
+        const r = currentData[idx];
+        const g = currentData[idx + 1];
+        const b = currentData[idx + 2];
+        const pixelColor: RGB = { r, g, b };
+
+        // Count transparent neighbors
+        let transparentNeighbors = 0;
+        const neighbors = [
+          [-1, -1], [0, -1], [1, -1],
+          [-1, 0],          [1, 0],
+          [-1, 1],  [0, 1],  [1, 1]
+        ];
+
+        for (const [dx, dy] of neighbors) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+            transparentNeighbors++;
+            continue;
+          }
+          const nIdx = (ny * width + nx) * channels;
+          if (currentData[nIdx + 3] < 128) {
+            transparentNeighbors++;
+          }
+        }
+
+        // Only process edge pixels (those with at least one transparent neighbor)
+        if (transparentNeighbors === 0) continue;
+
+        // Check if this pixel differs from the dominant color
+        const diffR = Math.abs(pixelColor.r - dominantColor.r);
+        const diffG = Math.abs(pixelColor.g - dominantColor.g);
+        const diffB = Math.abs(pixelColor.b - dominantColor.b);
+        const totalDiff = diffR + diffG + diffB;
+
+        // Skip if color matches dominant color
+        if (totalDiff < 30) continue;
+
+        // Check if this is a "washed out" variant of the dominant color
+        // (intermediate color between content and background)
+        const intensity = r + g + b;
+        const domIntensity = dominantColor.r + dominantColor.g + dominantColor.b;
+        const intensityDiff = Math.abs(intensity - domIntensity);
+
+        // Check hue similarity (same color, different brightness)
+        const maxChannel = Math.max(r, g, b);
+        const domMaxChannel = Math.max(dominantColor.r, dominantColor.g, dominantColor.b);
+
+        let isWashedOut = false;
+        if (maxChannel > 0 && domMaxChannel > 0) {
+          const rRatio = r / maxChannel;
+          const gRatio = g / maxChannel;
+          const bRatio = b / maxChannel;
+          const domRRatio = dominantColor.r / domMaxChannel;
+          const domGRatio = dominantColor.g / domMaxChannel;
+          const domBRatio = dominantColor.b / domMaxChannel;
+
+          const ratioMatch =
+            Math.abs(rRatio - domRRatio) < 0.3 &&
+            Math.abs(gRatio - domGRatio) < 0.3 &&
+            Math.abs(bRatio - domBRatio) < 0.3;
+
+          // Washed out if similar hue but different intensity
+          isWashedOut = ratioMatch && intensityDiff >= 20 && intensityDiff <= 150;
+        }
+
+        // Remove pixel if:
+        // 1. It's a washed-out variant of the dominant color, OR
+        // 2. It has 4+ transparent neighbors (isolated edge pixel)
+        if (isWashedOut || transparentNeighbors >= 4) {
+          outputData[idx] = 0;
+          outputData[idx + 1] = 0;
+          outputData[idx + 2] = 0;
+          outputData[idx + 3] = 0;
+          pixelsRemoved++;
+        }
+      }
+    }
+
+    if (pixelsRemoved === 0) {
+      break; // No more pixels to remove
+    }
+
+    currentData = outputData;
+  }
+
+  // Reconstruct image
+  return sharp(currentData, {
+    raw: { width, height, channels: 4 },
+  })
     .png()
     .toBuffer();
 }
@@ -666,8 +874,9 @@ export async function vectorizeImage(
 /**
  * Main conversion pipeline: Image to SVG
  * 1. Remove solid color background
- * 2. Trim transparent space
- * 3. Vectorize to SVG
+ * 2. Clean up gradient bleeding at edges (if enabled)
+ * 3. Trim transparent space
+ * 4. Vectorize to SVG
  */
 export async function convertImageToSvg(
   input: Buffer | string,
@@ -687,10 +896,19 @@ export async function convertImageToSvg(
     colorTolerance: options.colorTolerance,
   });
 
-  // Step 2: Trim alpha space
-  const trimmed = await trimAlpha(noBackground);
+  // Step 2: Clean up gradient bleeding at edges (if enabled)
+  let cleanedImage = noBackground;
+  if (options.gradientCleanup && options.gradientCleanup > 0) {
+    cleanedImage = await cleanupGradientEdges(noBackground, {
+      passes: Math.ceil(options.gradientCleanup / 2),
+      gradientTolerance: 30 + options.gradientCleanup * 5,
+    });
+  }
 
-  // Step 3: Vectorize to SVG
+  // Step 3: Trim alpha space
+  const trimmed = await trimAlpha(cleanedImage);
+
+  // Step 4: Vectorize to SVG
   const svg = await vectorizeImage(trimmed, {
     invert: options.invert,
     threshold: options.threshold,
