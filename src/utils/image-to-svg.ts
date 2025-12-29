@@ -46,6 +46,8 @@ export interface ImageToSvgOptions {
   upscale?: number;
   /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
   gradientCleanup?: number;
+  /** Maximum number of colors to trace. Default: 8 */
+  maxColors?: number;
 }
 
 interface RGB {
@@ -710,12 +712,49 @@ function rgbToHex(color: RGB): string {
 }
 
 /**
+ * Quantize an image to reduce the number of colors.
+ * This helps reduce anti-aliasing artifacts and JPEG compression noise.
+ */
+async function quantizeColors(
+  imageBuffer: Buffer,
+  levels: number = 16
+): Promise<Buffer> {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height } = info;
+  const channels = 4;
+  const outputData = Buffer.from(data);
+  const factor = 256 / levels;
+
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = data[i + 3];
+    if (alpha < 128) continue; // Keep transparent pixels unchanged
+
+    // Quantize each channel
+    outputData[i] = Math.round(Math.floor(data[i] / factor) * factor + factor / 2);
+    outputData[i + 1] = Math.round(Math.floor(data[i + 1] / factor) * factor + factor / 2);
+    outputData[i + 2] = Math.round(Math.floor(data[i + 2] / factor) * factor + factor / 2);
+  }
+
+  return sharp(outputData, {
+    raw: { width, height, channels: 4 },
+  })
+    .png()
+    .toBuffer();
+}
+
+/**
  * Extract unique colors from an image (ignoring transparent pixels)
  * Groups similar colors together based on tolerance
+ * @param maxColors - Maximum number of colors to return (default: 8)
  */
 async function extractUniqueColors(
   imageBuffer: Buffer,
-  tolerance: number = 20
+  tolerance: number = 40,
+  maxColors: number = 8
 ): Promise<RGB[]> {
   const { data } = await sharp(imageBuffer)
     .ensureAlpha()
@@ -723,16 +762,19 @@ async function extractUniqueColors(
     .toBuffer({ resolveWithObject: true });
 
   const channels = 4;
+
+  // First pass: Quantize and count colors
+  const quantizeFactor = 16; // Reduce to ~16 levels per channel
   const colorCounts = new Map<string, { color: RGB; count: number }>();
 
-  // Count all opaque pixel colors
   for (let i = 0; i < data.length; i += channels) {
     const alpha = data[i + 3];
     if (alpha < 128) continue; // Skip transparent pixels
 
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
+    // Quantize colors for counting
+    const r = Math.floor(data[i] / quantizeFactor) * quantizeFactor;
+    const g = Math.floor(data[i + 1] / quantizeFactor) * quantizeFactor;
+    const b = Math.floor(data[i + 2] / quantizeFactor) * quantizeFactor;
     const key = `${r},${g},${b}`;
 
     const existing = colorCounts.get(key);
@@ -748,9 +790,11 @@ async function extractUniqueColors(
     .sort((a, b) => b.count - a.count)
     .map(c => c.color);
 
-  // Group similar colors together
+  // Group similar colors together with increased tolerance
   const uniqueColors: RGB[] = [];
   for (const color of sortedColors) {
+    if (uniqueColors.length >= maxColors) break;
+
     const isSimilarToExisting = uniqueColors.some(
       existing => colorsMatch(color, existing, tolerance)
     );
@@ -885,22 +929,27 @@ async function vectorizeWithColors(
     turdSize?: number;
     alphaMax?: number;
     upscale?: number;
+    maxColors?: number;
   } = {}
 ): Promise<string> {
   const {
     turdPolicy = 'minority',
-    optTolerance = 0.1,  // Lower = more accurate curves
-    colorTolerance = 20,
-    turdSize = 2,        // Suppress tiny speckles only
-    alphaMax = 0.75,     // Sharper corners (0 = very sharp, 1.33 = very round)
-    upscale = 2,         // Upscale factor for smoother tracing
+    optTolerance = 0.5,  // Higher = simpler paths, smaller file
+    colorTolerance = 40, // Higher tolerance to group similar colors
+    turdSize = 8,        // Remove small speckles
+    alphaMax = 1.0,      // Smoother corners (0 = very sharp, 1.33 = very round)
+    upscale = 1,         // No upscaling by default (smaller files)
+    maxColors = 8,       // Limit number of colors to trace
   } = options;
 
-  // Upscale image for better tracing quality
-  const { buffer: processBuffer, originalWidth, originalHeight } = await upscaleForTracing(imageBuffer, upscale);
+  // Quantize the image to reduce anti-aliasing artifacts
+  const quantizedBuffer = await quantizeColors(imageBuffer, 16);
 
-  // Extract unique colors from the upscaled image
-  const colors = await extractUniqueColors(processBuffer, colorTolerance);
+  // Upscale image for better tracing quality
+  const { buffer: processBuffer, originalWidth, originalHeight } = await upscaleForTracing(quantizedBuffer, upscale);
+
+  // Extract unique colors from the quantized/upscaled image
+  const colors = await extractUniqueColors(processBuffer, colorTolerance, maxColors);
 
   if (colors.length === 0) {
     // No colors found, return empty SVG with original dimensions
@@ -966,12 +1015,13 @@ export async function vectorizeImage(
     threshold = 128,
     colorCount = 2,
     turdPolicy = 'minority',
-    optTolerance = 0.1,
+    optTolerance = 0.5,
     preserveColors = true,
-    colorTolerance = 20,
-    turdSize = 2,
-    alphaMax = 0.75,
-    upscale = 2,
+    colorTolerance = 40,
+    turdSize = 8,
+    alphaMax = 1.0,
+    upscale = 1,
+    maxColors = 8,
   } = options;
 
   // Use color-preserving vectorization by default
@@ -983,6 +1033,7 @@ export async function vectorizeImage(
       turdSize,
       alphaMax,
       upscale,
+      maxColors,
     });
   }
 
@@ -1076,6 +1127,7 @@ export async function convertImageToSvg(
     turdSize: options.turdSize,
     alphaMax: options.alphaMax,
     upscale: options.upscale,
+    maxColors: options.maxColors,
   });
 
   return svg;

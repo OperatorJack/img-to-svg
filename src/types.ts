@@ -21,17 +21,20 @@ export interface ImageToSvgConfig {
   upscale?: number;
   /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
   gradientCleanup?: number;
+  /** Maximum number of colors to trace. Default: 8 */
+  maxColors?: number;
 }
 
 export const defaultImageToSvgConfig: ImageToSvgConfig = {
-  colorTolerance: 30,
+  colorTolerance: 40,
   invert: false,
   threshold: 128,
   colorCount: 2,
   turdPolicy: 'minority',
-  optTolerance: 0.1,
-  turdSize: 2,
-  alphaMax: 0.75,
-  upscale: 2,
+  optTolerance: 0.5,
+  turdSize: 8,
+  alphaMax: 1.0,
+  upscale: 1,
   gradientCleanup: 0,
+  maxColors: 8,
 };
