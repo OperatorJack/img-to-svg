@@ -890,10 +890,10 @@ async function vectorizeWithColors(
   const {
     turdPolicy = 'minority',
     optTolerance = 0.5,  // Higher = simpler paths, smaller file
-    colorTolerance = 40, // Higher tolerance to group similar colors
+    colorTolerance = 60, // Higher tolerance to group similar colors
     turdSize = 8,        // Remove small speckles
     alphaMax = 1.0,      // Smoother corners (0 = very sharp, 1.33 = very round)
-    maxColors = 8,       // Limit number of colors to trace
+    maxColors = 2,       // Limit number of colors to trace
   } = options;
 
   // Get image dimensions
@@ -974,10 +974,10 @@ export async function vectorizeImage(
     turdPolicy = 'minority',
     optTolerance = 0.5,
     preserveColors = true,
-    colorTolerance = 40,
+    colorTolerance = 60,
     turdSize = 8,
     alphaMax = 1.0,
-    maxColors = 8,
+    maxColors = 2,
   } = options;
 
   // Use color-preserving vectorization by default

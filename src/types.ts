@@ -24,7 +24,7 @@ export interface ImageToSvgConfig {
 }
 
 export const defaultImageToSvgConfig: ImageToSvgConfig = {
-  colorTolerance: 40,
+  colorTolerance: 60,
   invert: false,
   threshold: 128,
   colorCount: 2,
@@ -33,5 +33,5 @@ export const defaultImageToSvgConfig: ImageToSvgConfig = {
   turdSize: 8,
   alphaMax: 1.0,
   gradientCleanup: 0,
-  maxColors: 8,
+  maxColors: 2,
 };

@@ -13,7 +13,7 @@ program
   .argument('<input>', 'Path to input image (PNG, JPEG, GIF, WebP, BMP, TIFF)')
   .option('-o, --output <path>', 'Output SVG file path (defaults to input name with .svg extension)')
   .option('-b, --background <color>', 'Background color to remove (hex, e.g., #ffffff). Auto-detects if not specified.')
-  .option('--tolerance <number>', 'Color tolerance for background removal (0-255)', '30')
+  .option('--tolerance <number>', 'Color tolerance for background removal (0-255)', '60')
   .option('--threshold <number>', 'Threshold for black/white conversion (0-255)', '128')
   .option('--colors <number>', 'Number of colors for posterization (2-256, use for multi-color logos)', '2')
   .option('--invert', 'Invert colors (useful for dark logos on light backgrounds)')
@@ -22,7 +22,7 @@ program
   .option('--turd-size <number>', 'Suppress speckles up to this size in pixels (higher = cleaner)', '8')
   .option('--alpha-max <number>', 'Corner sharpness (0-1.33, lower = sharper corners)', '0.75')
   .option('--gradient-cleanup <number>', 'Clean up gradient bleeding at edges (0=off, 1-5=intensity). Use for logos with gradient text on solid backgrounds.', '0')
-  .option('--max-colors <number>', 'Maximum number of colors to trace (reduces file size)', '8')
+  .option('--max-colors <number>', 'Maximum number of colors to trace (reduces file size)', '2')
   .action(async (input, options) => {
     console.log(chalk.bold('\n🎨 Image to SVG Conversion\n'));
 
