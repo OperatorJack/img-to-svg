@@ -42,8 +42,10 @@ export interface ImageToSvgOptions {
   turdSize?: number;
   /** Corner threshold (0 to 1.33). Lower = sharper corners. Default: 0.75 */
   alphaMax?: number;
-  /** Upscale factor before tracing for smoother curves. Default: 2 */
-  upscale?: number;
+  /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
+  gradientCleanup?: number;
+  /** Maximum number of colors to trace. Default: 8 */
+  maxColors?: number;
 }
 
 interface RGB {
@@ -339,6 +341,367 @@ export async function trimAlpha(imageBuffer: Buffer): Promise<Buffer> {
 }
 
 /**
+ * Check if a color lies on a gradient between two other colors
+ * Returns true if the test color appears to be a blend of color1 and color2
+ */
+function isColorOnGradient(test: RGB, color1: RGB, color2: RGB, tolerance: number): boolean {
+  // Check if test color's components fall between color1 and color2
+  const rMin = Math.min(color1.r, color2.r) - tolerance;
+  const rMax = Math.max(color1.r, color2.r) + tolerance;
+  const gMin = Math.min(color1.g, color2.g) - tolerance;
+  const gMax = Math.max(color1.g, color2.g) + tolerance;
+  const bMin = Math.min(color1.b, color2.b) - tolerance;
+  const bMax = Math.max(color1.b, color2.b) + tolerance;
+
+  return (
+    test.r >= rMin && test.r <= rMax &&
+    test.g >= gMin && test.g <= gMax &&
+    test.b >= bMin && test.b <= bMax
+  );
+}
+
+/**
+ * Get the dominant (most frequent) non-transparent color in an image
+ * Quantizes colors to reduce noise from anti-aliasing
+ */
+async function getDominantColor(imageBuffer: Buffer): Promise<RGB | null> {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const channels = info.channels;
+  const colorCounts = new Map<string, { color: RGB; count: number }>();
+
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = channels >= 4 ? data[i + 3] : 255;
+    if (alpha < 128) continue; // Skip transparent pixels
+
+    // Quantize colors by dividing by 8 to reduce noise
+    const r = Math.floor(data[i] / 8) * 8;
+    const g = Math.floor(data[i + 1] / 8) * 8;
+    const b = Math.floor(data[i + 2] / 8) * 8;
+    const key = `${r},${g},${b}`;
+
+    const existing = colorCounts.get(key);
+    if (existing) {
+      existing.count++;
+    } else {
+      colorCounts.set(key, { color: { r, g, b }, count: 1 });
+    }
+  }
+
+  if (colorCounts.size === 0) return null;
+
+  // Find the most frequent color
+  let maxCount = 0;
+  let dominantColor: RGB | null = null;
+
+  for (const { color, count } of colorCounts.values()) {
+    if (count > maxCount) {
+      maxCount = count;
+      dominantColor = color;
+    }
+  }
+
+  return dominantColor;
+}
+
+/**
+ * Clean up gradient bleeding at edges after background removal.
+ * Removes intermediate transition colors between content and background.
+ */
+export async function cleanupGradientEdges(
+  imageBuffer: Buffer,
+  options: {
+    backgroundColor?: RGB;
+    passes?: number;
+    gradientTolerance?: number;
+    smoothing?: number;
+  } = {}
+): Promise<Buffer> {
+  const {
+    passes = 2,
+    gradientTolerance = 40,
+    smoothing = 0,
+  } = options;
+
+  // Get dominant content color
+  const dominantColor = await getDominantColor(imageBuffer);
+  if (!dominantColor) {
+    return imageBuffer; // No content color found
+  }
+
+  let { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height } = info;
+  const channels = 4; // RGBA
+
+  // Work with mutable copy
+  let currentData: Uint8Array = Buffer.from(data);
+
+  for (let pass = 0; pass < passes; pass++) {
+    let pixelsRemoved = 0;
+    const outputData = Buffer.from(currentData);
+
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const idx = (y * width + x) * channels;
+        const alpha = currentData[idx + 3];
+
+        if (alpha < 128) continue; // Skip already transparent
+
+        const r = currentData[idx];
+        const g = currentData[idx + 1];
+        const b = currentData[idx + 2];
+        const pixelColor: RGB = { r, g, b };
+
+        // Count transparent neighbors
+        let transparentNeighbors = 0;
+        const neighbors = [
+          [-1, -1], [0, -1], [1, -1],
+          [-1, 0],          [1, 0],
+          [-1, 1],  [0, 1],  [1, 1]
+        ];
+
+        for (const [dx, dy] of neighbors) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+            transparentNeighbors++;
+            continue;
+          }
+          const nIdx = (ny * width + nx) * channels;
+          if (currentData[nIdx + 3] < 128) {
+            transparentNeighbors++;
+          }
+        }
+
+        // Only process edge pixels (those with at least one transparent neighbor)
+        if (transparentNeighbors === 0) continue;
+
+        // Check if this pixel differs from the dominant color
+        const diffR = Math.abs(pixelColor.r - dominantColor.r);
+        const diffG = Math.abs(pixelColor.g - dominantColor.g);
+        const diffB = Math.abs(pixelColor.b - dominantColor.b);
+        const totalDiff = diffR + diffG + diffB;
+
+        // Skip if color matches dominant color
+        if (totalDiff < 30) continue;
+
+        // Check if this is a "washed out" variant of the dominant color
+        // (intermediate color between content and background)
+        const intensity = r + g + b;
+        const domIntensity = dominantColor.r + dominantColor.g + dominantColor.b;
+        const intensityDiff = Math.abs(intensity - domIntensity);
+
+        // Check hue similarity (same color, different brightness)
+        const maxChannel = Math.max(r, g, b);
+        const domMaxChannel = Math.max(dominantColor.r, dominantColor.g, dominantColor.b);
+
+        let isWashedOut = false;
+        if (maxChannel > 0 && domMaxChannel > 0) {
+          const rRatio = r / maxChannel;
+          const gRatio = g / maxChannel;
+          const bRatio = b / maxChannel;
+          const domRRatio = dominantColor.r / domMaxChannel;
+          const domGRatio = dominantColor.g / domMaxChannel;
+          const domBRatio = dominantColor.b / domMaxChannel;
+
+          const ratioMatch =
+            Math.abs(rRatio - domRRatio) < 0.3 &&
+            Math.abs(gRatio - domGRatio) < 0.3 &&
+            Math.abs(bRatio - domBRatio) < 0.3;
+
+          // Washed out if similar hue but different intensity
+          isWashedOut = ratioMatch && intensityDiff >= 20 && intensityDiff <= 150;
+        }
+
+        // Remove pixel if:
+        // 1. It's a washed-out variant of the dominant color, OR
+        // 2. It has 4+ transparent neighbors (isolated edge pixel)
+        if (isWashedOut || transparentNeighbors >= 4) {
+          outputData[idx] = 0;
+          outputData[idx + 1] = 0;
+          outputData[idx + 2] = 0;
+          outputData[idx + 3] = 0;
+          pixelsRemoved++;
+        }
+      }
+    }
+
+    if (pixelsRemoved === 0) {
+      break; // No more pixels to remove
+    }
+
+    currentData = outputData;
+  }
+
+  // Apply morphological smoothing if requested
+  if (smoothing > 0) {
+    currentData = smoothEdges(currentData, width, height, smoothing, dominantColor);
+  }
+
+  // Reconstruct image
+  return sharp(currentData, {
+    raw: { width, height, channels: 4 },
+  })
+    .png()
+    .toBuffer();
+}
+
+/**
+ * Smooth edges using morphological operations.
+ * Performs closing (fill gaps) then opening (remove bumps).
+ * @param data - Raw RGBA buffer
+ * @param width - Image width
+ * @param height - Image height
+ * @param intensity - Smoothing intensity (1-5)
+ * @param dominantColor - The dominant content color to use for filling
+ */
+function smoothEdges(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  intensity: number,
+  dominantColor: RGB
+): Buffer {
+  const channels = 4;
+  let currentData: Uint8Array = Buffer.from(data);
+
+  // Number of passes based on intensity
+  const closingPasses = Math.ceil(intensity / 2); // Fill gaps
+  const openingPasses = Math.ceil(intensity / 2); // Remove bumps
+
+  // Closing operation: dilate then erode (fills small gaps)
+  for (let p = 0; p < closingPasses; p++) {
+    currentData = dilate(currentData, width, height, channels, dominantColor);
+  }
+  for (let p = 0; p < closingPasses; p++) {
+    currentData = erode(currentData, width, height, channels);
+  }
+
+  // Opening operation: erode then dilate (removes small bumps)
+  for (let p = 0; p < openingPasses; p++) {
+    currentData = erode(currentData, width, height, channels);
+  }
+  for (let p = 0; p < openingPasses; p++) {
+    currentData = dilate(currentData, width, height, channels, dominantColor);
+  }
+
+  return Buffer.from(currentData);
+}
+
+/**
+ * Morphological dilation - expands opaque regions.
+ * A transparent pixel becomes opaque if it has enough opaque neighbors.
+ */
+function dilate(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  channels: number,
+  fillColor: RGB
+): Uint8Array {
+  const output = Buffer.from(data);
+  const neighbors = [
+    [0, -1],  // top
+    [-1, 0],  // left
+    [1, 0],   // right
+    [0, 1],   // bottom
+  ];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * channels;
+      const alpha = data[idx + 3];
+
+      // Only process transparent pixels
+      if (alpha >= 128) continue;
+
+      // Count opaque neighbors (4-connectivity for less aggressive dilation)
+      let opaqueNeighbors = 0;
+      for (const [dx, dy] of neighbors) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        const nIdx = (ny * width + nx) * channels;
+        if (data[nIdx + 3] >= 128) {
+          opaqueNeighbors++;
+        }
+      }
+
+      // Fill if at least 2 opaque neighbors (fills gaps in edges)
+      if (opaqueNeighbors >= 2) {
+        output[idx] = fillColor.r;
+        output[idx + 1] = fillColor.g;
+        output[idx + 2] = fillColor.b;
+        output[idx + 3] = 255;
+      }
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Morphological erosion - shrinks opaque regions.
+ * An opaque pixel becomes transparent if it has enough transparent neighbors.
+ */
+function erode(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  channels: number
+): Uint8Array {
+  const output = Buffer.from(data);
+  const neighbors = [
+    [0, -1],  // top
+    [-1, 0],  // left
+    [1, 0],   // right
+    [0, 1],   // bottom
+  ];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * channels;
+      const alpha = data[idx + 3];
+
+      // Only process opaque pixels
+      if (alpha < 128) continue;
+
+      // Count transparent neighbors (4-connectivity)
+      let transparentNeighbors = 0;
+      for (const [dx, dy] of neighbors) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+          transparentNeighbors++; // Out of bounds counts as transparent
+          continue;
+        }
+        const nIdx = (ny * width + nx) * channels;
+        if (data[nIdx + 3] < 128) {
+          transparentNeighbors++;
+        }
+      }
+
+      // Remove if at least 2 transparent neighbors (removes bumps/protrusions)
+      if (transparentNeighbors >= 2) {
+        output[idx] = 0;
+        output[idx + 1] = 0;
+        output[idx + 2] = 0;
+        output[idx + 3] = 0;
+      }
+    }
+  }
+
+  return output;
+}
+
+/**
  * Convert RGB to hex color string
  */
 function rgbToHex(color: RGB): string {
@@ -347,12 +710,49 @@ function rgbToHex(color: RGB): string {
 }
 
 /**
+ * Quantize an image to reduce the number of colors.
+ * This helps reduce anti-aliasing artifacts and JPEG compression noise.
+ */
+async function quantizeColors(
+  imageBuffer: Buffer,
+  levels: number = 16
+): Promise<Buffer> {
+  const { data, info } = await sharp(imageBuffer)
+    .ensureAlpha()
+    .raw()
+    .toBuffer({ resolveWithObject: true });
+
+  const { width, height } = info;
+  const channels = 4;
+  const outputData = Buffer.from(data);
+  const factor = 256 / levels;
+
+  for (let i = 0; i < data.length; i += channels) {
+    const alpha = data[i + 3];
+    if (alpha < 128) continue; // Keep transparent pixels unchanged
+
+    // Quantize each channel
+    outputData[i] = Math.round(Math.floor(data[i] / factor) * factor + factor / 2);
+    outputData[i + 1] = Math.round(Math.floor(data[i + 1] / factor) * factor + factor / 2);
+    outputData[i + 2] = Math.round(Math.floor(data[i + 2] / factor) * factor + factor / 2);
+  }
+
+  return sharp(outputData, {
+    raw: { width, height, channels: 4 },
+  })
+    .png()
+    .toBuffer();
+}
+
+/**
  * Extract unique colors from an image (ignoring transparent pixels)
  * Groups similar colors together based on tolerance
+ * @param maxColors - Maximum number of colors to return (default: 8)
  */
 async function extractUniqueColors(
   imageBuffer: Buffer,
-  tolerance: number = 20
+  tolerance: number = 40,
+  maxColors: number = 8
 ): Promise<RGB[]> {
   const { data } = await sharp(imageBuffer)
     .ensureAlpha()
@@ -360,16 +760,19 @@ async function extractUniqueColors(
     .toBuffer({ resolveWithObject: true });
 
   const channels = 4;
+
+  // First pass: Quantize and count colors
+  const quantizeFactor = 16; // Reduce to ~16 levels per channel
   const colorCounts = new Map<string, { color: RGB; count: number }>();
 
-  // Count all opaque pixel colors
   for (let i = 0; i < data.length; i += channels) {
     const alpha = data[i + 3];
     if (alpha < 128) continue; // Skip transparent pixels
 
-    const r = data[i];
-    const g = data[i + 1];
-    const b = data[i + 2];
+    // Quantize colors for counting
+    const r = Math.floor(data[i] / quantizeFactor) * quantizeFactor;
+    const g = Math.floor(data[i + 1] / quantizeFactor) * quantizeFactor;
+    const b = Math.floor(data[i + 2] / quantizeFactor) * quantizeFactor;
     const key = `${r},${g},${b}`;
 
     const existing = colorCounts.get(key);
@@ -385,9 +788,11 @@ async function extractUniqueColors(
     .sort((a, b) => b.count - a.count)
     .map(c => c.color);
 
-  // Group similar colors together
+  // Group similar colors together with increased tolerance
   const uniqueColors: RGB[] = [];
   for (const color of sortedColors) {
+    if (uniqueColors.length >= maxColors) break;
+
     const isSimilarToExisting = uniqueColors.some(
       existing => colorsMatch(color, existing, tolerance)
     );
@@ -469,48 +874,6 @@ function extractViewBox(svg: string): { width: number; height: number } | null {
 }
 
 /**
- * Upscale an image for better tracing quality.
- * Upscaling before tracing produces smoother curves.
- */
-async function upscaleForTracing(
-  imageBuffer: Buffer,
-  scaleFactor: number = 2
-): Promise<{ buffer: Buffer; scale: number; originalWidth: number; originalHeight: number }> {
-  const metadata = await sharp(imageBuffer).metadata();
-  const originalWidth = metadata.width || 0;
-  const originalHeight = metadata.height || 0;
-
-  if (originalWidth === 0 || originalHeight === 0) {
-    return { buffer: imageBuffer, scale: 1, originalWidth, originalHeight };
-  }
-
-  // Limit maximum dimensions to prevent memory issues
-  const maxDimension = 4000;
-  const currentMax = Math.max(originalWidth, originalHeight);
-
-  // Adjust scale factor if resulting image would be too large
-  let effectiveScale = scaleFactor;
-  if (currentMax * scaleFactor > maxDimension) {
-    effectiveScale = maxDimension / currentMax;
-  }
-
-  if (effectiveScale <= 1) {
-    return { buffer: imageBuffer, scale: 1, originalWidth, originalHeight };
-  }
-
-  const upscaled = await sharp(imageBuffer)
-    .resize({
-      width: Math.round(originalWidth * effectiveScale),
-      height: Math.round(originalHeight * effectiveScale),
-      kernel: 'lanczos3',  // High-quality upscaling
-    })
-    .png()
-    .toBuffer();
-
-  return { buffer: upscaled, scale: effectiveScale, originalWidth, originalHeight };
-}
-
-/**
  * Convert a raster image to SVG with color preservation
  */
 async function vectorizeWithColors(
@@ -521,35 +884,44 @@ async function vectorizeWithColors(
     colorTolerance?: number;
     turdSize?: number;
     alphaMax?: number;
-    upscale?: number;
+    maxColors?: number;
   } = {}
 ): Promise<string> {
   const {
     turdPolicy = 'minority',
-    optTolerance = 0.1,  // Lower = more accurate curves
-    colorTolerance = 20,
-    turdSize = 2,        // Suppress tiny speckles only
-    alphaMax = 0.75,     // Sharper corners (0 = very sharp, 1.33 = very round)
-    upscale = 2,         // Upscale factor for smoother tracing
+    optTolerance = 0.5,  // Higher = simpler paths, smaller file
+    colorTolerance = 60, // Higher tolerance to group similar colors
+    turdSize = 8,        // Remove small speckles
+    alphaMax = 1.0,      // Smoother corners (0 = very sharp, 1.33 = very round)
+    maxColors = 2,       // Limit number of colors to trace
   } = options;
 
-  // Upscale image for better tracing quality
-  const { buffer: processBuffer, originalWidth, originalHeight } = await upscaleForTracing(imageBuffer, upscale);
+  // Get image dimensions
+  const metadata = await sharp(imageBuffer).metadata();
+  const width = metadata.width || 0;
+  const height = metadata.height || 0;
 
-  // Extract unique colors from the upscaled image
-  const colors = await extractUniqueColors(processBuffer, colorTolerance);
+  if (width === 0 || height === 0) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" viewBox="0 0 0 0"></svg>`;
+  }
+
+  // Quantize the image to reduce anti-aliasing artifacts
+  const quantizedBuffer = await quantizeColors(imageBuffer, 16);
+
+  // Extract unique colors from the quantized image
+  const colors = await extractUniqueColors(quantizedBuffer, colorTolerance, maxColors);
 
   if (colors.length === 0) {
-    // No colors found, return empty SVG with original dimensions
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${originalWidth} ${originalHeight}"></svg>`;
+    // No colors found, return empty SVG
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
   }
 
   const paths: { color: string; d: string }[] = [];
   let tracedViewBox: { width: number; height: number } | null = null;
 
-  // Trace each color separately using the upscaled buffer
+  // Trace each color separately
   for (const color of colors) {
-    const mask = await createColorMask(processBuffer, color, colorTolerance);
+    const mask = await createColorMask(quantizedBuffer, color, colorTolerance);
 
     const potraceOptions: potrace.PotraceOptions = {
       threshold: 128,
@@ -574,8 +946,8 @@ async function vectorizeWithColors(
   }
 
   if (paths.length === 0 || !tracedViewBox) {
-    // Fallback: return empty SVG with original dimensions
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${originalWidth} ${originalHeight}"></svg>`;
+    // Fallback: return empty SVG
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
   }
 
   // Combine all paths into a single SVG
@@ -583,10 +955,7 @@ async function vectorizeWithColors(
     .map(p => `\t<path d="${p.d}" fill="${p.color}" fill-rule="evenodd"/>`)
     .join('\n');
 
-  // Use original dimensions for display size, traced dimensions for viewBox
-  // This lets SVG's built-in scaling handle the coordinate transformation
-  // The paths are traced at higher resolution, giving smoother curves
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${tracedViewBox.width} ${tracedViewBox.height}" version="1.1">
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${tracedViewBox.width} ${tracedViewBox.height}" version="1.1">
 ${pathElements}
 </svg>`;
 }
@@ -603,12 +972,12 @@ export async function vectorizeImage(
     threshold = 128,
     colorCount = 2,
     turdPolicy = 'minority',
-    optTolerance = 0.1,
+    optTolerance = 0.5,
     preserveColors = true,
-    colorTolerance = 20,
-    turdSize = 2,
-    alphaMax = 0.75,
-    upscale = 2,
+    colorTolerance = 60,
+    turdSize = 8,
+    alphaMax = 1.0,
+    maxColors = 2,
   } = options;
 
   // Use color-preserving vectorization by default
@@ -619,7 +988,7 @@ export async function vectorizeImage(
       colorTolerance,
       turdSize,
       alphaMax,
-      upscale,
+      maxColors,
     });
   }
 
@@ -666,8 +1035,9 @@ export async function vectorizeImage(
 /**
  * Main conversion pipeline: Image to SVG
  * 1. Remove solid color background
- * 2. Trim transparent space
- * 3. Vectorize to SVG
+ * 2. Clean up gradient bleeding at edges (if enabled)
+ * 3. Trim transparent space
+ * 4. Vectorize to SVG
  */
 export async function convertImageToSvg(
   input: Buffer | string,
@@ -687,10 +1057,20 @@ export async function convertImageToSvg(
     colorTolerance: options.colorTolerance,
   });
 
-  // Step 2: Trim alpha space
-  const trimmed = await trimAlpha(noBackground);
+  // Step 2: Clean up gradient bleeding at edges (if enabled)
+  let cleanedImage = noBackground;
+  if (options.gradientCleanup && options.gradientCleanup > 0) {
+    cleanedImage = await cleanupGradientEdges(noBackground, {
+      passes: Math.ceil(options.gradientCleanup / 2),
+      gradientTolerance: 30 + options.gradientCleanup * 5,
+      smoothing: options.gradientCleanup, // Apply smoothing based on intensity
+    });
+  }
 
-  // Step 3: Vectorize to SVG
+  // Step 3: Trim alpha space
+  const trimmed = await trimAlpha(cleanedImage);
+
+  // Step 4: Vectorize to SVG
   const svg = await vectorizeImage(trimmed, {
     invert: options.invert,
     threshold: options.threshold,
@@ -701,7 +1081,7 @@ export async function convertImageToSvg(
     colorTolerance: options.colorTolerance,
     turdSize: options.turdSize,
     alphaMax: options.alphaMax,
-    upscale: options.upscale,
+    maxColors: options.maxColors,
   });
 
   return svg;

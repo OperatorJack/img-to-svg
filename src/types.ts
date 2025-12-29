@@ -17,18 +17,21 @@ export interface ImageToSvgConfig {
   turdSize?: number;
   /** Corner threshold (0 to 1.33). Lower = sharper corners. Default: 0.75 */
   alphaMax?: number;
-  /** Upscale factor before tracing for smoother curves. Default: 2 */
-  upscale?: number;
+  /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
+  gradientCleanup?: number;
+  /** Maximum number of colors to trace. Default: 8 */
+  maxColors?: number;
 }
 
 export const defaultImageToSvgConfig: ImageToSvgConfig = {
-  colorTolerance: 30,
+  colorTolerance: 60,
   invert: false,
   threshold: 128,
   colorCount: 2,
   turdPolicy: 'minority',
-  optTolerance: 0.1,
-  turdSize: 2,
-  alphaMax: 0.75,
-  upscale: 2,
+  optTolerance: 0.5,
+  turdSize: 8,
+  alphaMax: 1.0,
+  gradientCleanup: 0,
+  maxColors: 2,
 };
