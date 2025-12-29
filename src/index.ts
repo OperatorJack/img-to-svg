@@ -21,7 +21,6 @@ program
   .option('--opt-tolerance <number>', 'Curve optimization tolerance (higher = simpler paths)', '0.5')
   .option('--turd-size <number>', 'Suppress speckles up to this size in pixels (higher = cleaner)', '8')
   .option('--alpha-max <number>', 'Corner sharpness (0-1.33, lower = sharper corners)', '0.75')
-  .option('--upscale <number>', 'Upscale factor before tracing for smoother curves (1-4)', '1')
   .option('--gradient-cleanup <number>', 'Clean up gradient bleeding at edges (0=off, 1-5=intensity). Use for logos with gradient text on solid backgrounds.', '0')
   .option('--max-colors <number>', 'Maximum number of colors to trace (reduces file size)', '8')
   .action(async (input, options) => {
@@ -57,7 +56,6 @@ program
         optTolerance: parseFloat(options.optTolerance),
         turdSize: parseInt(options.turdSize, 10),
         alphaMax: parseFloat(options.alphaMax),
-        upscale: parseFloat(options.upscale),
         gradientCleanup,
         maxColors,
       };

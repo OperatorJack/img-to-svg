@@ -42,8 +42,6 @@ export interface ImageToSvgOptions {
   turdSize?: number;
   /** Corner threshold (0 to 1.33). Lower = sharper corners. Default: 0.75 */
   alphaMax?: number;
-  /** Upscale factor before tracing for smoother curves. Default: 2 */
-  upscale?: number;
   /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
   gradientCleanup?: number;
   /** Maximum number of colors to trace. Default: 8 */
@@ -876,48 +874,6 @@ function extractViewBox(svg: string): { width: number; height: number } | null {
 }
 
 /**
- * Upscale an image for better tracing quality.
- * Upscaling before tracing produces smoother curves.
- */
-async function upscaleForTracing(
-  imageBuffer: Buffer,
-  scaleFactor: number = 2
-): Promise<{ buffer: Buffer; scale: number; originalWidth: number; originalHeight: number }> {
-  const metadata = await sharp(imageBuffer).metadata();
-  const originalWidth = metadata.width || 0;
-  const originalHeight = metadata.height || 0;
-
-  if (originalWidth === 0 || originalHeight === 0) {
-    return { buffer: imageBuffer, scale: 1, originalWidth, originalHeight };
-  }
-
-  // Limit maximum dimensions to prevent memory issues
-  const maxDimension = 4000;
-  const currentMax = Math.max(originalWidth, originalHeight);
-
-  // Adjust scale factor if resulting image would be too large
-  let effectiveScale = scaleFactor;
-  if (currentMax * scaleFactor > maxDimension) {
-    effectiveScale = maxDimension / currentMax;
-  }
-
-  if (effectiveScale <= 1) {
-    return { buffer: imageBuffer, scale: 1, originalWidth, originalHeight };
-  }
-
-  const upscaled = await sharp(imageBuffer)
-    .resize({
-      width: Math.round(originalWidth * effectiveScale),
-      height: Math.round(originalHeight * effectiveScale),
-      kernel: 'lanczos3',  // High-quality upscaling
-    })
-    .png()
-    .toBuffer();
-
-  return { buffer: upscaled, scale: effectiveScale, originalWidth, originalHeight };
-}
-
-/**
  * Convert a raster image to SVG with color preservation
  */
 async function vectorizeWithColors(
@@ -928,7 +884,6 @@ async function vectorizeWithColors(
     colorTolerance?: number;
     turdSize?: number;
     alphaMax?: number;
-    upscale?: number;
     maxColors?: number;
   } = {}
 ): Promise<string> {
@@ -938,30 +893,35 @@ async function vectorizeWithColors(
     colorTolerance = 40, // Higher tolerance to group similar colors
     turdSize = 8,        // Remove small speckles
     alphaMax = 1.0,      // Smoother corners (0 = very sharp, 1.33 = very round)
-    upscale = 1,         // No upscaling by default (smaller files)
     maxColors = 8,       // Limit number of colors to trace
   } = options;
+
+  // Get image dimensions
+  const metadata = await sharp(imageBuffer).metadata();
+  const width = metadata.width || 0;
+  const height = metadata.height || 0;
+
+  if (width === 0 || height === 0) {
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" viewBox="0 0 0 0"></svg>`;
+  }
 
   // Quantize the image to reduce anti-aliasing artifacts
   const quantizedBuffer = await quantizeColors(imageBuffer, 16);
 
-  // Upscale image for better tracing quality
-  const { buffer: processBuffer, originalWidth, originalHeight } = await upscaleForTracing(quantizedBuffer, upscale);
-
-  // Extract unique colors from the quantized/upscaled image
-  const colors = await extractUniqueColors(processBuffer, colorTolerance, maxColors);
+  // Extract unique colors from the quantized image
+  const colors = await extractUniqueColors(quantizedBuffer, colorTolerance, maxColors);
 
   if (colors.length === 0) {
-    // No colors found, return empty SVG with original dimensions
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${originalWidth} ${originalHeight}"></svg>`;
+    // No colors found, return empty SVG
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
   }
 
   const paths: { color: string; d: string }[] = [];
   let tracedViewBox: { width: number; height: number } | null = null;
 
-  // Trace each color separately using the upscaled buffer
+  // Trace each color separately
   for (const color of colors) {
-    const mask = await createColorMask(processBuffer, color, colorTolerance);
+    const mask = await createColorMask(quantizedBuffer, color, colorTolerance);
 
     const potraceOptions: potrace.PotraceOptions = {
       threshold: 128,
@@ -986,8 +946,8 @@ async function vectorizeWithColors(
   }
 
   if (paths.length === 0 || !tracedViewBox) {
-    // Fallback: return empty SVG with original dimensions
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${originalWidth} ${originalHeight}"></svg>`;
+    // Fallback: return empty SVG
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}"></svg>`;
   }
 
   // Combine all paths into a single SVG
@@ -995,10 +955,7 @@ async function vectorizeWithColors(
     .map(p => `\t<path d="${p.d}" fill="${p.color}" fill-rule="evenodd"/>`)
     .join('\n');
 
-  // Use original dimensions for display size, traced dimensions for viewBox
-  // This lets SVG's built-in scaling handle the coordinate transformation
-  // The paths are traced at higher resolution, giving smoother curves
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="${originalWidth}" height="${originalHeight}" viewBox="0 0 ${tracedViewBox.width} ${tracedViewBox.height}" version="1.1">
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${tracedViewBox.width} ${tracedViewBox.height}" version="1.1">
 ${pathElements}
 </svg>`;
 }
@@ -1020,7 +977,6 @@ export async function vectorizeImage(
     colorTolerance = 40,
     turdSize = 8,
     alphaMax = 1.0,
-    upscale = 1,
     maxColors = 8,
   } = options;
 
@@ -1032,7 +988,6 @@ export async function vectorizeImage(
       colorTolerance,
       turdSize,
       alphaMax,
-      upscale,
       maxColors,
     });
   }
@@ -1126,7 +1081,6 @@ export async function convertImageToSvg(
     colorTolerance: options.colorTolerance,
     turdSize: options.turdSize,
     alphaMax: options.alphaMax,
-    upscale: options.upscale,
     maxColors: options.maxColors,
   });
 

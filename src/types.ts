@@ -17,8 +17,6 @@ export interface ImageToSvgConfig {
   turdSize?: number;
   /** Corner threshold (0 to 1.33). Lower = sharper corners. Default: 0.75 */
   alphaMax?: number;
-  /** Upscale factor before tracing for smoother curves. Default: 2 */
-  upscale?: number;
   /** Clean up gradient bleeding at edges. Higher = more aggressive cleanup. Default: 0 (disabled) */
   gradientCleanup?: number;
   /** Maximum number of colors to trace. Default: 8 */
@@ -34,7 +32,6 @@ export const defaultImageToSvgConfig: ImageToSvgConfig = {
   optTolerance: 0.5,
   turdSize: 8,
   alphaMax: 1.0,
-  upscale: 1,
   gradientCleanup: 0,
   maxColors: 8,
 };
