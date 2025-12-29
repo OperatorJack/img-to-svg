@@ -417,11 +417,13 @@ export async function cleanupGradientEdges(
     backgroundColor?: RGB;
     passes?: number;
     gradientTolerance?: number;
+    smoothing?: number;
   } = {}
 ): Promise<Buffer> {
   const {
     passes = 2,
     gradientTolerance = 40,
+    smoothing = 0,
   } = options;
 
   // Get dominant content color
@@ -439,7 +441,7 @@ export async function cleanupGradientEdges(
   const channels = 4; // RGBA
 
   // Work with mutable copy
-  let currentData = Buffer.from(data);
+  let currentData: Uint8Array = Buffer.from(data);
 
   for (let pass = 0; pass < passes; pass++) {
     let pixelsRemoved = 0;
@@ -538,12 +540,165 @@ export async function cleanupGradientEdges(
     currentData = outputData;
   }
 
+  // Apply morphological smoothing if requested
+  if (smoothing > 0) {
+    currentData = smoothEdges(currentData, width, height, smoothing, dominantColor);
+  }
+
   // Reconstruct image
   return sharp(currentData, {
     raw: { width, height, channels: 4 },
   })
     .png()
     .toBuffer();
+}
+
+/**
+ * Smooth edges using morphological operations.
+ * Performs closing (fill gaps) then opening (remove bumps).
+ * @param data - Raw RGBA buffer
+ * @param width - Image width
+ * @param height - Image height
+ * @param intensity - Smoothing intensity (1-5)
+ * @param dominantColor - The dominant content color to use for filling
+ */
+function smoothEdges(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  intensity: number,
+  dominantColor: RGB
+): Buffer {
+  const channels = 4;
+  let currentData: Uint8Array = Buffer.from(data);
+
+  // Number of passes based on intensity
+  const closingPasses = Math.ceil(intensity / 2); // Fill gaps
+  const openingPasses = Math.ceil(intensity / 2); // Remove bumps
+
+  // Closing operation: dilate then erode (fills small gaps)
+  for (let p = 0; p < closingPasses; p++) {
+    currentData = dilate(currentData, width, height, channels, dominantColor);
+  }
+  for (let p = 0; p < closingPasses; p++) {
+    currentData = erode(currentData, width, height, channels);
+  }
+
+  // Opening operation: erode then dilate (removes small bumps)
+  for (let p = 0; p < openingPasses; p++) {
+    currentData = erode(currentData, width, height, channels);
+  }
+  for (let p = 0; p < openingPasses; p++) {
+    currentData = dilate(currentData, width, height, channels, dominantColor);
+  }
+
+  return Buffer.from(currentData);
+}
+
+/**
+ * Morphological dilation - expands opaque regions.
+ * A transparent pixel becomes opaque if it has enough opaque neighbors.
+ */
+function dilate(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  channels: number,
+  fillColor: RGB
+): Uint8Array {
+  const output = Buffer.from(data);
+  const neighbors = [
+    [0, -1],  // top
+    [-1, 0],  // left
+    [1, 0],   // right
+    [0, 1],   // bottom
+  ];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * channels;
+      const alpha = data[idx + 3];
+
+      // Only process transparent pixels
+      if (alpha >= 128) continue;
+
+      // Count opaque neighbors (4-connectivity for less aggressive dilation)
+      let opaqueNeighbors = 0;
+      for (const [dx, dy] of neighbors) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        const nIdx = (ny * width + nx) * channels;
+        if (data[nIdx + 3] >= 128) {
+          opaqueNeighbors++;
+        }
+      }
+
+      // Fill if at least 2 opaque neighbors (fills gaps in edges)
+      if (opaqueNeighbors >= 2) {
+        output[idx] = fillColor.r;
+        output[idx + 1] = fillColor.g;
+        output[idx + 2] = fillColor.b;
+        output[idx + 3] = 255;
+      }
+    }
+  }
+
+  return output;
+}
+
+/**
+ * Morphological erosion - shrinks opaque regions.
+ * An opaque pixel becomes transparent if it has enough transparent neighbors.
+ */
+function erode(
+  data: Uint8Array,
+  width: number,
+  height: number,
+  channels: number
+): Uint8Array {
+  const output = Buffer.from(data);
+  const neighbors = [
+    [0, -1],  // top
+    [-1, 0],  // left
+    [1, 0],   // right
+    [0, 1],   // bottom
+  ];
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const idx = (y * width + x) * channels;
+      const alpha = data[idx + 3];
+
+      // Only process opaque pixels
+      if (alpha < 128) continue;
+
+      // Count transparent neighbors (4-connectivity)
+      let transparentNeighbors = 0;
+      for (const [dx, dy] of neighbors) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
+          transparentNeighbors++; // Out of bounds counts as transparent
+          continue;
+        }
+        const nIdx = (ny * width + nx) * channels;
+        if (data[nIdx + 3] < 128) {
+          transparentNeighbors++;
+        }
+      }
+
+      // Remove if at least 2 transparent neighbors (removes bumps/protrusions)
+      if (transparentNeighbors >= 2) {
+        output[idx] = 0;
+        output[idx + 1] = 0;
+        output[idx + 2] = 0;
+        output[idx + 3] = 0;
+      }
+    }
+  }
+
+  return output;
 }
 
 /**
@@ -902,6 +1057,7 @@ export async function convertImageToSvg(
     cleanedImage = await cleanupGradientEdges(noBackground, {
       passes: Math.ceil(options.gradientCleanup / 2),
       gradientTolerance: 30 + options.gradientCleanup * 5,
+      smoothing: options.gradientCleanup, // Apply smoothing based on intensity
     });
   }
 
